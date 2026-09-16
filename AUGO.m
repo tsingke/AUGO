@@ -49,18 +49,51 @@ function [gbestX, gbestfitness, gbesthistory] = AUGO(varargin)
 %    Note: this file releases a snapshot of the implementation that
 %    accompanies the submitted manuscript. Any code or results released
 %    after the review process concludes should be treated as authoritative.
-% =========================================================================
-% AUGO: Asymmetric Undulatory Growth Optimizer.
-% Supports both interfaces:
-%   PlatECO/CEC: AUGO(mainHandle,popsize,dimension,xmax,xmin,vmax,vmin,maxiter,Func,FuncId,VisualSwitch)
-%   Segmentation: AUGO(popsize,dimension,maxiter,xmax,xmin,probR,Func,Class)
 %
-% The search core keeps the original AUGO stages. The only added mechanism
-% is a small generic best-neighborhood refinement, which is not
-% threshold-specific and can also work for CEC functions.
+% -------------------------------------------------------------------------
+%  Module map
+%    Module 1  Input parsing and run configuration
+%    Module 2  State initialization
+%    Module 3  Initial population evaluation
+%    Module 4  Main loop
+%                4.0  Progress clock and annealing factor
+%                4.1  UADSAP -- dynamic reference-pool bounds
+%                4.2  Stage 1 -- learning (vector growth)
+%                4.3  Stage 2 -- AT-CQ reflection and Cauchy escape
+%                4.4  Stage 3 -- UDGF elite differential-Gaussian refinement
+%                4.5  Stage 3b -- UDGF best-neighbourhood refinement
+%    Module 5  Convergence-history bookkeeping
+%    Local functions      printProgress, refineBest
+%    External functions   parseInputs, sortedIndex, isBetter, clampBounds,
+%                         selectID
+%
+%    All three mechanisms are driven by the same normalized evaluation
+%    progress, which is why FEs is threaded through every stage below.
+% =========================================================================
 
+% =========================================================================
+%  Module 1 -- Input parsing and run configuration
+% =========================================================================
+%  parseInputs resolves the two supported call signatures and returns a
+%  uniform set of run parameters together with a Fitness handle, the
+%  optimization sense (isMinimize) and the output mapping (outputBest).
+%
+%  The evaluation budget is derived rather than hard-coded:
+%      MaxFEs = popsize * maxiter
+%  so the benchmark protocol (N = 40, 10000*D evaluations) is obtained with
+%  maxiter = 250*D, and the segmentation protocol (6000 evaluations) with
+%  popsize = 40 and maxiter = 150.
+% =========================================================================
 [popsize, dimension, maxiter, xmax, xmin, Fitness, isMinimize, outputBest] = parseInputs(varargin{:});
 
+% =========================================================================
+%  Module 2 -- State initialization
+% =========================================================================
+%  FEs is the single progress counter: it drives the annealing schedules of
+%  every stage below and terminates the main loop. gbesthistory records the
+%  incumbent after each evaluation, so a convergence curve can be rebuilt
+%  from one run.
+% =========================================================================
 FEs = 0;
 MaxFEs = popsize * maxiter;
 printStep = max(1, floor(MaxFEs / 10));
@@ -69,6 +102,8 @@ x = xmin + (xmax - xmin) .* rand(popsize, dimension);
 fitness = zeros(popsize, 1);
 gbesthistory = nan(1, MaxFEs);
 
+% The incumbent is initialized to the identity of the optimization sense, so
+% the first evaluated individual always replaces it.
 if isMinimize
     gbestfitness = inf;
 else
@@ -77,6 +112,14 @@ end
 gbestPosition = zeros(1, dimension);
 gbestX = outputBest(gbestPosition);
 
+% =========================================================================
+%  Module 3 -- Initial population evaluation
+% =========================================================================
+%  Initialization is charged to the budget: each of the N initial individuals
+%  consumes one evaluation and is immediately eligible to become the
+%  incumbent. This is what makes progress = FEs / MaxFEs well defined from
+%  the very first cycle.
+% =========================================================================
 for i = 1:popsize
     fitness(i) = Fitness(x(i,:));
     FEs = FEs + 1;
@@ -91,10 +134,37 @@ for i = 1:popsize
     printProgress();
 end
 
+% =========================================================================
+%  Module 4 -- Main loop
+% =========================================================================
+%  One cycle runs the learning stage, the reflection stage and the two
+%  refinement stages in a fixed order, and consumes at least 2N + K
+%  evaluations. Each stage re-reads the ranking and the incumbent, so the
+%  greedy selections made in one stage propagate to the next.
+% =========================================================================
 while FEs < MaxFEs
+    % ---------------------------------------------------------------------
+    %  Module 4.0 -- Progress clock and undulatory annealing factor
+    % ---------------------------------------------------------------------
+    %  progress is the normalized evaluation progress in [0, 1]. alpha is the
+    %  undulatory annealing factor: it decays smoothly from ~1 to 0 across the
+    %  run and is the common driver of the UADSAP pool bounds and of the UDGF
+    %  perturbation scales.
+    % ---------------------------------------------------------------------
     progress = FEs / MaxFEs;
     alpha = (cos(pi * progress) + 1) / 2;
 
+    % ---------------------------------------------------------------------
+    %  Module 4.1 -- UADSAP dynamic reference-pool bounds
+    % ---------------------------------------------------------------------
+    %  The ranking is recomputed from the current fitness before the pools are
+    %  sampled. The superior pool spans ranks 2 .. ub_better and the inferior
+    %  pool spans ranks lb_worst .. N. Both bounds contract as alpha decays,
+    %  so the learning stage draws on a broad cross-section of the population
+    %  early and concentrates on the extreme ranks late. Rank 1 is excluded
+    %  from the superior pool because it is the incumbent itself.
+    %  rho_p = 0.5 is the reference-pool rank-boundary ratio.
+    % ---------------------------------------------------------------------
     ind = sortedIndex(fitness, isMinimize);
     Best_X = x(ind(1), :);
 
@@ -106,6 +176,9 @@ while FEs < MaxFEs
     lb_worst = round((popsize - 4) - ((popsize - 4) - min_worst) * alpha);
     lb_worst = min(popsize, max(1, lb_worst));
 
+    % Scaling-factor denominator. The guards keep the ratio finite when the
+    % population extreme approaches zero under minimization, or when an
+    % individual fitness is zero under maximization.
     if isMinimize
         max_fit = max(fitness);
         if abs(max_fit) < eps
@@ -115,7 +188,17 @@ while FEs < MaxFEs
         min_fit = min(fitness);
     end
 
-    % Stage 1: original dynamic-pool vector growth.
+    % ---------------------------------------------------------------------
+    %  Module 4.2 -- Stage 1: learning (vector growth with UADSAP pools)
+    % ---------------------------------------------------------------------
+    %  Four difference vectors are formed from the incumbent, one dynamic
+    %  superior reference, one dynamic inferior reference and two distinct
+    %  randomly selected individuals. Each vector is weighted by its relative
+    %  length (LF) and by the scaling factor SF; their weighted sum is the
+    %  knowledge increment. A rare random acceptance (p = 0.001) admits
+    %  non-improving moves in order to preserve diversity; otherwise the
+    %  update is greedy. The stage stops as soon as the budget is exhausted.
+    % ---------------------------------------------------------------------
     for i = 1:popsize
         better_idx = ind(randi([2, ub_better]));
         Better_X = x(better_idx, :);
@@ -188,10 +271,26 @@ while FEs < MaxFEs
         break;
     end
 
+    % The ranking is refreshed so that Stage 2 samples from a current order.
     ind = sortedIndex(fitness, isMinimize);
     Best_X = x(ind(1), :);
 
-    % Stage 2: original asymmetric reflection and Cauchy quantum escape.
+    % ---------------------------------------------------------------------
+    %  Module 4.3 -- Stage 2: AT-CQ reflection and Cauchy quantum escape
+    % ---------------------------------------------------------------------
+    %  Each dimension is visited in turn. With probability 0.3 the reflection
+    %  branch fires and moves the coordinate toward a superior reference with
+    %  a time-varying weight rand^(1 + 0.5*progress). Because the exponent
+    %  grows with progress, the expected weight shrinks monotonically, so
+    %  reflection becomes conservative late in the run.
+    %
+    %  Conditional on entering the branch, an escape event fires with
+    %  probability 0.01 + 0.09*(1 - progress), decaying from p_q^max = 0.10 to
+    %  0.01. It resolves with equal probability into either a uniform reset
+    %  over the search range or a Cauchy heavy-tailed jump whose magnitude is
+    %  scaled by the distance to the incumbent. Either branch overwrites the
+    %  guided value.
+    % ---------------------------------------------------------------------
     for i = 1:popsize
         newx_i = x(i,:);
         j = 1;
@@ -242,7 +341,16 @@ while FEs < MaxFEs
 
     ind = sortedIndex(fitness, isMinimize);
 
-    % Stage 3: original UDGF elite differential-Gaussian refinement.
+    % ---------------------------------------------------------------------
+    %  Module 4.4 -- Stage 3: UDGF elite differential-Gaussian refinement
+    % ---------------------------------------------------------------------
+    %  A fixed number of trials (K = 5) are spent refining the elite region.
+    %  The base individual is drawn from the top 5% of the ranking and is
+    %  perturbed along a differential vector formed by two distinct random
+    %  individuals, with per-dimension Gaussian noise and a scale that
+    %  contracts as (1 - progress). Selection is strictly greedy, so the
+    %  elite individual never degrades.
+    % ---------------------------------------------------------------------
     if FEs < MaxFEs
         for k_elite = 1:5
             if FEs >= MaxFEs
@@ -281,9 +389,19 @@ while FEs < MaxFEs
         end
     end
 
-    % Conservative generic add-on: a tiny best-neighborhood refinement.
-    % It is continuous, late-stage, and budget-limited, so it is not tied
-    % to threshold segmentation and has low impact on the original dynamics.
+    % ---------------------------------------------------------------------
+    %  Module 4.5 -- Stage 3b: UDGF best-neighbourhood refinement
+    % ---------------------------------------------------------------------
+    %  The second UDGF subprocess searches the neighbourhood of the incumbent
+    %  with a Gaussian/Cauchy mixture restricted to a Bernoulli(0.25) mask of
+    %  coordinates. It is deliberately conservative:
+    %    * continuous and threshold-agnostic, so the same code serves both
+    %      interfaces and neither is favoured;
+    %    * late-stage only, activated once progress > 0.2;
+    %    * budget limited to B = min(max(8, ceil(eta_B * N)), MaxFEs - FEs)
+    %      with eta_B = 0.20, so it cannot overshoot the evaluation budget.
+    %  Selection is greedy, so the incumbent never degrades.
+    % ---------------------------------------------------------------------
     if FEs < MaxFEs && progress > 0.2
         refineBudget = min(max(8, ceil(0.20 * popsize)), MaxFEs - FEs);
         [gbestPosition, gbestfitness, FEs, gbesthistory] = refineBest(gbestPosition, gbestfitness, FEs, gbesthistory, refineBudget, progress);
@@ -291,18 +409,47 @@ while FEs < MaxFEs
     end
 end
 
+% =========================================================================
+%  Module 5 -- Convergence-history bookkeeping
+% =========================================================================
+%  A stage can overshoot MaxFEs by its last evaluation, so the history is
+%  padded or truncated to exactly MaxFEs entries before it is returned.
+% =========================================================================
 if FEs < MaxFEs
     gbesthistory(FEs+1:MaxFEs) = gbestfitness;
 elseif FEs > MaxFEs
     gbesthistory(MaxFEs+1:end) = [];
 end
 
+    % =====================================================================
+    %  Local function -- progress reporting
+    % =====================================================================
+    %  Prints the incumbent at roughly ten evenly spaced points across the
+    %  budget. It shares the workspace of the main function, so FEs,
+    %  MaxFEs, printStep and gbestfitness are read directly.
+    % =====================================================================
     function printProgress()
         if mod(FEs, printStep) == 0 && FEs <= MaxFEs
             fprintf("AUGO %d FEs, best fitness = %e\n", FEs, gbestfitness);
         end
     end
 
+    % =====================================================================
+    %  Local function -- refineBest (Module 4.5 inner loop)
+    % =====================================================================
+    %  Inputs : bestPos, bestFit   current incumbent
+    %           evals, history     evaluation counter and convergence record
+    %           budget             maximum evaluations this call may spend
+    %           progressNow        normalized progress at entry
+    %  Outputs: updated incumbent, counter and history
+    %
+    %  A Bernoulli(0.25) mask selects the coordinates to perturb, with at
+    %  least one coordinate forced active. The perturbation is Gaussian with
+    %  probability 0.75 and Cauchy with probability 0.25; the heavy tail is
+    %  retained so that occasional larger deviations remain possible inside an
+    %  otherwise local search. The scale sigma contracts with progress,
+    %  giving coarse-to-fine behaviour. Selection is greedy.
+    % =====================================================================
     function [bestPos, bestFit, evals, history] = refineBest(bestPos, bestFit, evals, history, budget, progressNow)
         used = 0;
         sigma = (xmax - xmin) * (0.06 * (1 - progressNow) + 0.004);
@@ -335,6 +482,15 @@ end
     end
 end
 
+% =========================================================================
+%  External function -- parseInputs
+% =========================================================================
+%  Resolves the two supported call signatures. The argument positions differ
+%  between them, so both layouts are mapped onto the same set of outputs:
+%  the 11-argument benchmark layout is always a minimization problem and
+%  returns the raw decision vector, while the 8-argument segmentation layout
+%  is always a maximization problem and returns integer thresholds via fix().
+% =========================================================================
 function [popsize, dimension, maxiter, xmax, xmin, Fitness, isMinimize, outputBest] = parseInputs(varargin)
 if nargin == 11
     popsize = varargin{2};
@@ -364,6 +520,13 @@ else
 end
 end
 
+% =========================================================================
+%  External function -- sortedIndex
+% =========================================================================
+%  Ranking helper. Sorting direction follows the optimization sense, so
+%  ind(1) is always the best individual and ind(end) the worst. The UADSAP
+%  pool bounds are expressed directly in these rank positions.
+% =========================================================================
 function ind = sortedIndex(fitness, isMinimize)
 if isMinimize
     [~, ind] = sort(fitness);
@@ -372,6 +535,13 @@ else
 end
 end
 
+% =========================================================================
+%  External function -- isBetter
+% =========================================================================
+%  Single comparison primitive, sense-aware. Every greedy decision in the
+%  algorithm routes through this function, which is what allows the same
+%  search core to serve both a minimization and a maximization interface.
+% =========================================================================
 function ok = isBetter(candidateFitness, referenceFitness, isMinimize)
 if isMinimize
     ok = candidateFitness < referenceFitness;
@@ -380,11 +550,24 @@ else
 end
 end
 
+% =========================================================================
+%  External function -- clampBounds
+% =========================================================================
+%  Box-constraint projection. Applied to every trial solution before it is
+%  evaluated, so no infeasible point ever reaches the objective.
+% =========================================================================
 function y = clampBounds(y, xmin, xmax)
 y = max(y, xmin);
 y = min(y, xmax);
 end
 
+% =========================================================================
+%  External function -- selectID
+% =========================================================================
+%  Draws `count` distinct indices from 1..popsize, excluding the caller's own
+%  index i. Used by the learning stage to form the differential vector
+%  x(L1,:) - x(L2,:) from two other individuals.
+% =========================================================================
 function r = selectID(popsize, i, count)
 lists = randperm(popsize);
 r = lists(1:count+1);
