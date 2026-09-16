@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this code or refer to this work, please cite it using the metadata below. The manuscript is currently under review; the citation record will be updated with the venue and the final author list upon acceptance."
+title: "AUGO: An Asymmetric Undulatory Growth Optimizer for Continuous Optimization"
+type: software
+license: MIT
+repository-code: "https://github.com/tsingke/AUGO"
+keywords:
+  - continuous optimization
+  - metaheuristic optimization
+  - global optimization
+  - growth optimizer
+  - adaptive search
+  - CEC2017 benchmark
+  - multilevel thresholding image segmentation
+  - UAV path planning
+authors:
+  - family-names: Zhang
+    given-names: Qingke
+    orcid: "https://orcid.org/0000-0003-3960-172X"
+    email: tsingke@sdnu.edu.cn
+    affiliation: "School of Computer Science and Artificial Intelligence, Shandong Normal University, Jinan 250358, China"

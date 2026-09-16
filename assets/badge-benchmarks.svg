@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="222" height="20" role="img" aria-label="benchmarks: CEC2017 30/50/100D">
+  <title>benchmarks: CEC2017 30/50/100D</title>
+  <linearGradient id="s" x2="0" y2="100%">
+    <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+    <stop offset="1" stop-opacity=".1"/>
+  </linearGradient>
+  <clipPath id="r"><rect width="222" height="20" rx="3" fill="#fff"/></clipPath>
+  <g clip-path="url(#r)">
+    <rect width="82" height="20" fill="#555"/>
+    <rect x="82" width="140" height="20" fill="#0969da"/>
+    <rect width="222" height="20" fill="url(#s)"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11">
+    <text x="41.0" y="15" fill="#010101" fill-opacity=".3">benchmarks</text>
+    <text x="41.0" y="14">benchmarks</text>
+    <text x="152.0" y="15" fill="#010101" fill-opacity=".3">CEC2017 30/50/100D</text>
+    <text x="152.0" y="14">CEC2017 30/50/100D</text>
+  </g>
+</svg>
